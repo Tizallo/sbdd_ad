@@ -123,10 +123,9 @@ static int sbdd_create(void) {
     // set queue
     blk_queue_logical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
     blk_queue_physical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
-
-    // setup gendisk TODO
+  
     __sbdd.gd->fops = &sbdd_bdev_ops;
-  // TODO
+  
     __sbdd.gd->private_data = &__sbdd;
     snprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDD_NAME);
     set_capacity(__sbdd.gd, __sbdd.capacity);
