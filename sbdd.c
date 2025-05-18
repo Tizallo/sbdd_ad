@@ -21,14 +21,20 @@
 
 #define SBDD_SECTOR_SHIFT       9
 #define SBDD_SECTOR_SIZE        (1 << SBDD_SECTOR_SHIFT)
-#define SBDD_MIB_SECTORS        (1 << (20 - SBDD_SECTOR_SHIFT))
 #define SBDD_NAME               "sbdd"
 
+struct bio_context {
+    struct bio *orig_bio;
+    atomic_t completions_remaining;
+    blk_status_t status;
+};
 
 // https://elixir.bootlin.com/linux/v6.8.8/source/include/linux/blk_types.h#L264
 struct sbdd {
-    struct bdev_handle     *bdev_handle;    
-    struct block_device    *backing_bdev;   
+    struct bdev_handle     *bdev_handle1;    
+    struct block_device    *backing_bdev1;   
+    struct bdev_handle     *bdev_handle2;    
+    struct block_device    *backing_bdev2;   
     struct gendisk         *gd;             
     sector_t               capacity;        
     atomic_t               refs_cnt;        
@@ -37,17 +43,27 @@ struct sbdd {
 };
 
 static struct sbdd __sbdd;
-static char *sbdd_backing_dev = NULL;
+static char *sbdd_backing_dev1 = NULL;
+static char *sbdd_backing_dev2 = NULL;
 
-module_param_named(backing_dev, sbdd_backing_dev, charp, 0644);
-MODULE_PARM_DESC(backing_dev, "Path to backing block device");
+module_param_named(backing_dev1, sbdd_backing_dev1, charp, 0644);
+MODULE_PARM_DESC(backing_dev1, "Path to first backing block device");
+module_param_named(backing_dev2, sbdd_backing_dev2, charp, 0644);
+MODULE_PARM_DESC(backing_dev2, "Path to second backing block device");
 
 static void sbdd_bio_endio(struct bio *bio)
 {
-    struct bio *orig_bio = bio->bi_private;
+    struct bio_context *ctx = bio->bi_private;
+    blk_status_t status = bio->bi_status;
 
-    orig_bio->bi_status = bio->bi_status;
-    bio_endio(orig_bio);
+    if (status != BLK_STS_OK && ctx->status == BLK_STS_OK)
+        ctx->status = status;
+
+    if (atomic_dec_and_test(&ctx->completions_remaining)) {
+        ctx->orig_bio->bi_status = ctx->status;
+        bio_endio(ctx->orig_bio);
+        kfree(ctx);
+    }
 
     if (atomic_dec_and_test(&__sbdd.refs_cnt))
         wake_up(&__sbdd.exitwait);
@@ -57,29 +73,50 @@ static void sbdd_bio_endio(struct bio *bio)
 
 static void sbdd_submit_bio(struct bio *bio)
 {
-    struct bio *clone_bio;
+    struct bio *clone1 = NULL, *clone2 = NULL;
+    struct bio_context *ctx;
 
     if (atomic_read(&__sbdd.deleting)) {
         bio_io_error(bio);
         return;
     }
 
-    atomic_inc(&__sbdd.refs_cnt);
-
-    // https://elixir.bootlin.com/linux/v6.8.8/source/block/bio.c#L833
-    clone_bio = bio_alloc_clone(__sbdd.backing_bdev, bio, GFP_KERNEL, &fs_bio_set);
-    if (!clone_bio) {
-        atomic_dec(&__sbdd.refs_cnt);
+    ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+    if (!ctx) {
         bio_io_error(bio);
         return;
     }
 
-    clone_bio->bi_end_io = sbdd_bio_endio;
-    clone_bio->bi_private = bio;
-    clone_bio->bi_opf = bio->bi_opf; 
-    submit_bio(clone_bio);
-}
+    ctx->orig_bio = bio;
+    atomic_set(&ctx->completions_remaining, 2);
+    ctx->status = BLK_STS_OK;
 
+    // https://elixir.bootlin.com/linux/v6.8.8/source/block/bio.c#L833
+    clone1 = bio_alloc_clone(__sbdd.backing_bdev1, bio, GFP_KERNEL, &fs_bio_set);
+    if (!clone1) goto error;
+
+    clone2 = bio_alloc_clone(__sbdd.backing_bdev2, bio, GFP_KERNEL, &fs_bio_set);
+    if (!clone2) goto error;
+
+    clone1->bi_end_io = sbdd_bio_endio;
+    clone1->bi_private = ctx;
+    clone1->bi_opf = bio->bi_opf;
+
+    clone2->bi_end_io = sbdd_bio_endio;
+    clone2->bi_private = ctx;
+    clone2->bi_opf = bio->bi_opf;
+
+    atomic_add(2, &__sbdd.refs_cnt);
+    submit_bio(clone1);
+    submit_bio(clone2);
+    return;
+
+error:
+    if (clone1) bio_put(clone1);
+    if (clone2) bio_put(clone2);
+    kfree(ctx);
+    bio_io_error(bio);
+}
 
 /*
 There are no read or write operations. These operations are performed by
@@ -94,61 +131,67 @@ static const struct block_device_operations sbdd_bdev_ops = {
 static int sbdd_create(void) {
     int ret = 0;
     blk_mode_t mode = BLK_OPEN_READ | BLK_OPEN_WRITE;
+    sector_t cap1, cap2;
 
-    if (!sbdd_backing_dev) {
-        pr_err("backing_dev parameter is required!\n");
+    if (!sbdd_backing_dev1 || !sbdd_backing_dev2) {
+        pr_err("Both backing devices are required!\n");
         return -EINVAL;
     }
-
     // open block device
-    __sbdd.bdev_handle = bdev_open_by_path(sbdd_backing_dev, mode, THIS_MODULE, NULL);
-    if (IS_ERR(__sbdd.bdev_handle)) {
-        ret = PTR_ERR(__sbdd.bdev_handle);
-        pr_err("Failed to open %s: %d\n", sbdd_backing_dev, ret);
+    __sbdd.bdev_handle1 = bdev_open_by_path(sbdd_backing_dev1, mode, THIS_MODULE, NULL);
+    if (IS_ERR(__sbdd.bdev_handle1)) {
+        ret = PTR_ERR(__sbdd.bdev_handle1);
+        pr_err("Failed to open %s: %d\n", sbdd_backing_dev1, ret);
         return ret;
     }
-    __sbdd.backing_bdev = __sbdd.bdev_handle->bdev;
+    __sbdd.backing_bdev1 = __sbdd.bdev_handle1->bdev;
 
-    // set capacity
-    __sbdd.capacity = bdev_nr_sectors(__sbdd.backing_bdev);
+    // open block device
+    __sbdd.bdev_handle2 = bdev_open_by_path(sbdd_backing_dev2, mode, THIS_MODULE, NULL);
+    if (IS_ERR(__sbdd.bdev_handle2)) {
+        ret = PTR_ERR(__sbdd.bdev_handle2);
+        pr_err("Failed to open %s: %d\n", sbdd_backing_dev2, ret);
+        bdev_release(__sbdd.bdev_handle1);
+        return ret;
+    }
+
+    __sbdd.backing_bdev2 = __sbdd.bdev_handle2->bdev;
+
+    cap1 = bdev_nr_sectors(__sbdd.backing_bdev1);
+    cap2 = bdev_nr_sectors(__sbdd.backing_bdev2);
+    __sbdd.capacity = min(cap1, cap2);
 
     // init gendisk
     __sbdd.gd = blk_alloc_disk(NUMA_NO_NODE);
     if (!__sbdd.gd) {
-   		ret = PTR_ERR(__sbdd.gd);
-   		__sbdd.gd = NULL;
-        goto fail_release_bdev;
+        ret = -ENOMEM;
+        goto fail_release_bdevs;
     }
 
     // set queue
     blk_queue_logical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
     blk_queue_physical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
 
-    // setup gendisk TODO
     __sbdd.gd->fops = &sbdd_bdev_ops;
-  // TODO
     __sbdd.gd->private_data = &__sbdd;
     snprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDD_NAME);
     set_capacity(__sbdd.gd, __sbdd.capacity);
 
-    // init sync
     atomic_set(&__sbdd.refs_cnt, 0);
     atomic_set(&__sbdd.deleting, 0);
     init_waitqueue_head(&__sbdd.exitwait);
 
-    // disk registration
     ret = add_disk(__sbdd.gd);
-    if (ret) {
-        pr_err("add_disk() failed\n");
+    if (ret)
         goto fail_put_disk;
-    }
 
     return 0;
 
 fail_put_disk:
     put_disk(__sbdd.gd);
-fail_release_bdev:
-    bdev_release(__sbdd.bdev_handle);
+fail_release_bdevs:
+    bdev_release(__sbdd.bdev_handle1);
+    bdev_release(__sbdd.bdev_handle2);
     return ret;
 }
 
@@ -157,13 +200,11 @@ static void sbdd_delete(void) {
     wait_event(__sbdd.exitwait, atomic_read(&__sbdd.refs_cnt) == 0);
 
     if (__sbdd.gd) {
-   		pr_info("deleting disk\n");
         del_gendisk(__sbdd.gd);
         put_disk(__sbdd.gd);
     }
-    if (__sbdd.bdev_handle) {
-        bdev_release(__sbdd.bdev_handle);
-    }
+    bdev_release(__sbdd.bdev_handle1);
+    bdev_release(__sbdd.bdev_handle2);
 }
 
 /*
@@ -174,10 +215,7 @@ There is also __initdata note, same but used for variables.
 
 static int __init sbdd_init(void)
 {
-    int ret = sbdd_create();
-    if (ret)
-        pr_err("Initialization failed\n");
-    return ret;
+    return sbdd_create();
 }
 
 /*
@@ -188,11 +226,7 @@ directly into the kernel). There is also __exitdata note.
 
 static void __exit sbdd_exit(void)
 {
-    pr_info("exiting...\n");
     sbdd_delete();
-  	pr_info("exiting complete\n");
-
-
 }
 
 /* Called on module loading. Is mandatory. */
@@ -200,9 +234,9 @@ static void __exit sbdd_exit(void)
 module_init(sbdd_init);
 
 /* Called on module unloading. Unloading module is not allowed without it. */
-module_exit(sbdd_exit);
 
+module_exit(sbdd_exit);
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Simple Block Device Driver (Proxy)");
+MODULE_DESCRIPTION("Dual Backing Block Device Driver");

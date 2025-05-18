@@ -1,50 +1,92 @@
-# Simple Proxy Block Device Driver
-Implementation of Linux kernel 6.8.X simple proxy block device.
+# Dual Backing Block Device Driver
+Implementation of Linux kernel 6.8.X dual Backing Block Device Driver.
 
 ## Build
-`make`
+```bash
+make
+```
 
 ## Clean
-`make clean`
+```bash
+make clean
+```
 
 ## Install SBDD Module
-`sudo insmod sbdd.ko backing_dev=/dev/sdX`
-
+```bash
+sudo insmod sbdd.ko backing_dev1=/dev/sdX backing_dev2=/dev/sdY
+```
 ## Check module
-`lsmod | grep sbdd`
+```bash
+lsmod | grep sbdd
+```
 
 ## Remove module
-`sudo rmmod sbdd`
+```bash
+sudo rmmod sbdd
+```
 
 
 ## Tests with dd(warning!)
-`sudo dd if=/dev/zero of=/dev/sdX bs=4k count=1 oflag=direct`
+```bash
+sudo dd if=/dev/zero of=/dev/sdX bs=4k count=1 oflag=direct
+```
 
-`sudo dd if=/dev/sdX bs=4k count=1 status=none | hexdump -C`
+```bash
+sudo dd if=/dev/zero of=/dev/sdY bs=4k count=1 oflag=direct
+```
+
+```bash
+sudo dd if=/dev/sd(X or Y) bs=4k count=1 status=none | hexdump -C
+```
 
 ### output:
-`00000000  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|`
+```bash
+00000000  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+```
 
 ### next:
 
-`echo 0xdead | sudo dd of=/dev/sbdd bs=4k count=1 oflag=direct conv=notrunc,sync`
+```bash
+echo "0xTEST" | sudo dd of=/dev/sbdd bs=4k count=1 oflag=direct conv=notrunc,sync
+```
 
-`sudo dd if=/dev/sbdd bs=4k count=1 status=none oflag=direct | hexdump -C`
+```bash
+sudo rmmod sbdd
+```
+```bash
+sudo insmod sbdd.ko backing_dev1=/dev/sdX backing_dev2=/dev/sdY
+````
+
+```bash
+sudo dd if=/dev/sda(X or Y) bs=4k count=1 status=none oflag=direct | hexdump -C
+```
 
 ### output: 
 
-`00000000  30 78 64 65 61 64 0a 00  00 00 00 00 00 00 00 00  |0xdead..........|`
-
+```bash
+00000000  30 78 54 45 53 54 0a 00  00 00 00 00 00 00 00 00  |0xTEST..........|
+```
 # FIO tests
 
-`sudo fio --name=write_phase --rw=write --filename=/dev/sdbb --size=1G     --verify=pattern --verify_pattern=0xdeadbeef --do_verify=1`
+```bash
+sudo fio --name=write_phase --rw=write --filename=/dev/sdbb --size=1G     --verify=pattern --verify_pattern=0xdeadbeef --do_verify=1
+````
 
-`fio --name=read_phase --rw=read --filename=/dev/sdbb --size=1G --verify=pattern --verify_pattern=0xdeadbeef --do_verify=1`
+```bash
+fio --name=read_phase --rw=read --filename=/dev/sdbb --size=1G --verify=pattern --verify_pattern=0xdeadbeef --do_verify=1
+```
 
+## check: 
 
+```bash
+sudo dd if=/dev/sda(X or Y) bs=4k count=1 status=none oflag=direct | hexdump -C
+```
 
-# TODO: RAID1 implementation
+### output:
 
+```bash
+00000000  de ad be ef de ad be ef  de ad be ef de ad be ef  |................|
+```
 
 ## References
 - [Linux Device Drivers](https://lwn.net/Kernel/LDD3/)
